@@ -1,7 +1,7 @@
 # Goofy Ahh Proxy
 
-goofyproxy allows you to share your internet connection with a friend through
-weird means of data transfer.
+goofyproxy is a Python package allows you to share your internet connection with
+a friend through weird means of data transfer.
 
 # `GoofyIo`
 
@@ -25,16 +25,15 @@ gzip compression to send and receive data.
 # `GoofyServer`
 
 The **Goofy Ahh Proxy Server** is run by the lucky volunteer with normal
-internet access. It works with any well-implemented goofy ahh channel
-(`GoofyIo`).
+internet access. It works with any well-implemented `GoofyIo`.
 
 See `goofy_server.py` for more details. It's human-readable code.
 
 # `GoofyClient`
 
 The **Goofy Ahh Proxy Client** is run by the unfortunate person with no proper
-internet access. It works with any well-implemented goofy ahh channel
-(`GoofyIo`) as long as the server is already running on the other side.
+internet access. It works with any well-implemented `GoofyIo` as long as the
+server is already running on the other side.
 
 The **Goofy Ahh Proxy Client** runs a local SOCKS5 proxy server that other
 devices or programs on the LAN can connect to. It then communicates with the

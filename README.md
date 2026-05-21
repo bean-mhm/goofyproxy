@@ -23,7 +23,7 @@ Now let's see what this project provides.
 
 # goofyproxy
 
-[goofyproxy](./goofyproxy) is the backbone of this project. It provides three
+[goofyproxy](./goofyproxy) is the backbone of the project. It provides three
 fundumental classes we can build upon: `GoofyIo`, `GoofyServer` and
 `GoofyClient`.
 
