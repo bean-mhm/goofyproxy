@@ -63,6 +63,12 @@ class GoofyClientSocket:
     last_io_time: float = 0.
 
     lock: threading.Lock = field(default_factory=threading.Lock)
+    status_updated_event: threading.Event = field(
+        default_factory=threading.Event
+    )
+    inbound_info_event: threading.Event = field(
+        default_factory=threading.Event
+    )
 
 
 @dataclass
@@ -114,9 +120,6 @@ class GoofyClient:
 
         udp_timeout (float):
             idle timeout for UDP relay threads
-
-        poll_interval (float):
-            interval in seconds for checking socket status updates
 
         send_interval (float):
             interval in seconds for the control thread to send all queued
@@ -190,7 +193,6 @@ class GoofyClient:
     _timeout: float
     _bind_timeout: float
     _udp_timeout: float
-    _poll_interval: float
     _send_interval: float
     _address_filter: str
     _address_filter_type: AddressFilterType
@@ -255,14 +257,6 @@ class GoofyClient:
     def udp_timeout(self, value: float):
         self._udp_timeout = float(value)
         self._sync_limits()
-
-    @property
-    def poll_interval(self) -> float:
-        return self._poll_interval
-
-    @poll_interval.setter
-    def poll_interval(self, value: float):
-        self._poll_interval = float(value)
 
     @property
     def send_interval(self) -> float:
@@ -401,14 +395,13 @@ class GoofyClient:
     def __init__(
         self,
         io: GoofyIo,
-        host: str = "0.0.0.0",
+        host: str = "127.0.0.1",
         port: int = 1080,
         max_relay_size: int = 16384,
         backlog: int = 200,
         timeout: float = 60.0,
         bind_timeout: float = 60.0,
         udp_timeout: float = 60.0,
-        poll_interval: float = .01,
         send_interval: float = .005,
         address_filter: str = "",
         address_filter_type: AddressFilterType = AddressFilterType.Block,
@@ -435,7 +428,6 @@ class GoofyClient:
         self._timeout = float(timeout)
         self._bind_timeout = float(bind_timeout)
         self._udp_timeout = float(udp_timeout)
-        self._poll_interval = float(poll_interval)
         self._send_interval = float(send_interval)
         self._address_filter = address_filter
         self._address_filter_type = address_filter_type
@@ -461,7 +453,10 @@ class GoofyClient:
         self._server_sock.listen(self._backlog)
         self._server_sock.settimeout(2.)
 
-        msg = f"local SOCKS5 proxy server running on {self._host}:{self._port}"
+        msg = (
+            f"local SOCKS5 proxy server listening at "
+            f"{format_addr(self._server_sock.getsockname())}"
+        )
         if self._host == "0.0.0.0":
             machine_ips = get_machine_ips()
             if machine_ips:
@@ -572,7 +567,7 @@ class GoofyClient:
             elif cmd == CMD_UDP_ASSOCIATE:
                 cmd_name = "UDP_ASSOCIATE"
             else:
-                cmd_name = f"unsupported command ({cmd})"
+                cmd_name = f"unsupported command: {cmd}"
 
             threading.current_thread().name = \
                 f"[{cmd_name}] {threading.current_thread().name}"
@@ -739,83 +734,89 @@ class GoofyClient:
                 0
             )
 
-        # wait for the receive thread to update the status
-        time_start = time.time()
-        while True:
-            # stop if socket id is no longer in the dict
-            force_acquire(self._sockets_lock)
-            if socket_id not in self._sockets.keys():
-                self._sockets_lock.release()
-
-                sock.status = GoofySocketStatus.Closed
-                if early_success:
-                    close_socket(client)
-                else:
-                    self._send_error_and_close(client, REP_GENERAL_FAILURE)
-
-                raise Exception("socket ID is no longer in the dictionary")
-
+        # wait for the receive thread to update the status, or time out.
+        if not sock.status_updated_event.wait(self._timeout * 1.2):
             force_acquire(sock.lock)
+            sock.status = GoofySocketStatus.Closed
+            sock.lock.release()
 
-            status = sock.status
-            fail_reply, fail_name = status.failure_to_socks_reply()
-
-            if status == GoofySocketStatus.WaitingToOpen:
-                # stop if we've been waiting for too long
-                if time.time() - time_start > self._timeout * 1.2:
-                    sock.status = GoofySocketStatus.Closed
-                    if early_success:
-                        close_socket(client)
-                    else:
-                        self._send_error_and_close(
-                            client,
-                            REP_HOST_UNREACHABLE
-                        )
-
-                    self._sockets.pop(socket_id, None)
-                    sock.lock.release()
-                    self._sockets_lock.release()
-
-                    raise TimeoutError("been waiting to open for too long")
-
-                # otherwise keep waiting
-                sock.lock.release()
-                self._sockets_lock.release()
-                time.sleep(self._poll_interval)
-                continue
-            elif fail_reply != -1:
-                # failed to open
-
-                sock.status = GoofySocketStatus.Closed
-                if early_success:
-                    close_socket(client)
-                else:
-                    self._send_error_and_close(client, fail_reply)
-
-                self._sockets.pop(socket_id, None)
-                sock.lock.release()
-                self._sockets_lock.release()
-
-                raise Exception(f"failed to open ({fail_name})")
-            elif status in [
-                GoofySocketStatus.Open,
-                GoofySocketStatus.Closed
-            ]:
-                # socket was opened (may be closed by now but still)
-                self._sockets_lock.release()
-                break
+            if early_success:
+                close_socket(client)
             else:
-                sock.status = GoofySocketStatus.Closed
-                if early_success:
-                    close_socket(client)
-                else:
-                    self._send_error_and_close(client, REP_GENERAL_FAILURE)
+                self._send_error_and_close(
+                    client,
+                    REP_HOST_UNREACHABLE
+                )
 
-                self._sockets.pop(socket_id, None)
-                sock.lock.release()
-                self._sockets_lock.release()
+            force_acquire(self._sockets_lock)
+            self._sockets.pop(socket_id, None)
+            self._sockets_lock.release()
 
-                raise ValueError("unsupported socket status")
+            raise TimeoutError("been waiting to open for too long")
+
+        force_acquire(sock.lock)
+        status = sock.status
+        fail_reply, fail_name = status.failure_to_socks_reply()
+
+        if status == GoofySocketStatus.WaitingToOpen:
+            # the status update event was set but the status hasn't changed.
+            # this is never supposed to happen!
+
+            sock.status = GoofySocketStatus.Closed
+            sock.lock.release()
+
+            if early_success:
+                close_socket(client)
+            else:
+                self._send_error_and_close(
+                    client,
+                    REP_GENERAL_FAILURE
+                )
+
+            force_acquire(self._sockets_lock)
+            self._sockets.pop(socket_id, None)
+            self._sockets_lock.release()
+
+            raise ValueError(
+                "status update event was set but the status hasn't actually "
+                "changed. this should never happen."
+            )
+        elif fail_reply != -1:
+            # failed to open
+
+            sock.status = GoofySocketStatus.Closed
+            sock.lock.release()
+
+            if early_success:
+                close_socket(client)
+            else:
+                self._send_error_and_close(client, fail_reply)
+
+            force_acquire(self._sockets_lock)
+            self._sockets.pop(socket_id, None)
+            self._sockets_lock.release()
+
+            raise Exception(f"failed to open: {fail_name}")
+        elif status in [
+            GoofySocketStatus.Open,
+            GoofySocketStatus.Closed
+        ]:
+            # socket was opened (may be closed by now but still)
+            sock.lock.release()
+        else:
+            sock.status = GoofySocketStatus.Closed
+            sock.lock.release()
+
+            if early_success:
+                close_socket(client)
+            else:
+                self._send_error_and_close(client, REP_GENERAL_FAILURE)
+
+            force_acquire(self._sockets_lock)
+            self._sockets.pop(socket_id, None)
+            self._sockets_lock.release()
+
+            raise ValueError(f"unsupported socket status: {status}")
 
         # inform the client which local address the goofy server bound to
         if not early_success:
@@ -827,9 +828,8 @@ class GoofyClient:
             )
 
         # the control and receive threads will handle relaying and closing
-        sock.relaying = True
         sock.last_io_time = time.time()
-        sock.lock.release()
+        sock.relaying = True
         self._log.debug(
             f"relay planned: {dst_host}:{dst_port}"
         )
@@ -952,68 +952,71 @@ class GoofyClient:
         # tell goofy server to bind a listening socket
         self._enqueue_outgoing_packet(GoofyCommandBind(socket_id))
 
-        # wait for the receive thread to update the status
-        time_start = time.time()
-        while True:
-            # stop if socket id is no longer in the dict
-            force_acquire(self._sockets_lock)
-            if socket_id not in self._sockets.keys():
-                self._sockets_lock.release()
-
-                sock.status = GoofySocketStatus.Closed
-                self._send_error_and_close(client, REP_GENERAL_FAILURE)
-
-                raise Exception("socket ID is no longer in the dictionary")
-
+        # wait for the receive thread to update the status, or time out.
+        if not sock.status_updated_event.wait(self._timeout * 1.2):
             force_acquire(sock.lock)
+            sock.status = GoofySocketStatus.Closed
+            sock.lock.release()
 
-            status = sock.status
-            fail_reply, fail_name = status.failure_to_socks_reply()
+            self._send_error_and_close(client, REP_HOST_UNREACHABLE)
 
-            if status == GoofySocketStatus.WaitingToOpen:
-                # stop if we've been waiting for longer than bind_timeout
-                if time.time() - time_start > self._bind_timeout * 1.2:
-                    sock.status = GoofySocketStatus.Closed
-                    self._send_error_and_close(client, REP_GENERAL_FAILURE)
+            force_acquire(self._sockets_lock)
+            self._sockets.pop(socket_id, None)
+            self._sockets_lock.release()
 
-                    self._sockets.pop(socket_id, None)
-                    sock.lock.release()
-                    self._sockets_lock.release()
+            raise TimeoutError("been waiting to open for too long")
 
-                    raise TimeoutError("been waiting to open for too long")
+        force_acquire(sock.lock)
+        status = sock.status
+        fail_reply, fail_name = status.failure_to_socks_reply()
 
-                # otherwise keep waiting
-                sock.lock.release()
-                self._sockets_lock.release()
-                time.sleep(self._poll_interval)
-                continue
-            elif fail_reply != -1:
-                # failed to bind
+        if status == GoofySocketStatus.WaitingToOpen:
+            # the status update event was set but the status hasn't changed.
+            # this is never supposed to happen!
 
-                sock.status = GoofySocketStatus.Closed
-                self._send_error_and_close(client, fail_reply)
+            sock.status = GoofySocketStatus.Closed
+            sock.lock.release()
 
-                self._sockets.pop(socket_id, None)
-                sock.lock.release()
-                self._sockets_lock.release()
+            self._send_error_and_close(client, REP_GENERAL_FAILURE)
 
-                raise Exception(f"failed to bind ({fail_name})")
-            elif status in [
-                GoofySocketStatus.Open,
-                GoofySocketStatus.Closed
-            ]:
-                # socket was opened (may be closed by now but still)
-                self._sockets_lock.release()
-                break
-            else:
-                sock.status = GoofySocketStatus.Closed
-                self._send_error_and_close(client, REP_GENERAL_FAILURE)
+            force_acquire(self._sockets_lock)
+            self._sockets.pop(socket_id, None)
+            self._sockets_lock.release()
 
-                self._sockets.pop(socket_id, None)
-                sock.lock.release()
-                self._sockets_lock.release()
+            raise ValueError(
+                "status update event was set but the status hasn't actually "
+                "changed. this should never happen."
+            )
+        elif fail_reply != -1:
+            # failed to bind
 
-                raise ValueError("unsupported socket status")
+            sock.status = GoofySocketStatus.Closed
+            sock.lock.release()
+
+            self._send_error_and_close(client, fail_reply)
+
+            force_acquire(self._sockets_lock)
+            self._sockets.pop(socket_id, None)
+            self._sockets_lock.release()
+
+            raise Exception(f"failed to bind: {fail_name}")
+        elif status in [
+            GoofySocketStatus.Open,
+            GoofySocketStatus.Closed
+        ]:
+            # socket was opened (may be closed by now but still)
+            pass
+        else:
+            sock.status = GoofySocketStatus.Closed
+            sock.lock.release()
+
+            self._send_error_and_close(client, REP_GENERAL_FAILURE)
+
+            force_acquire(self._sockets_lock)
+            self._sockets.pop(socket_id, None)
+            self._sockets_lock.release()
+
+            raise ValueError(f"unsupported socket status: {status}")
 
         # first reply: tell the client where the server is listening
         self._send_reply(
@@ -1027,62 +1030,64 @@ class GoofyClient:
             f"{sock.bind_host}:{sock.bind_port}"
         )
 
-        # wait for the expected remote peer to connect. we will know it happened
-        # when the inbound address is set by the receive thread.
+        # wait for the expected remote peer to connect, or time out.
         sock.lock.release()
-        time_start = time.time()
-        while True:
-            # stop if socket id is no longer in the dict
-            force_acquire(self._sockets_lock)
-            if socket_id not in self._sockets.keys():
-                self._sockets_lock.release()
-
-                sock.status = GoofySocketStatus.Closed
-                self._send_error_and_close(client, REP_TTL_EXPIRED)
-
-                raise Exception("socket ID is no longer in the dictionary")
-
+        if not sock.inbound_info_event.wait(self._bind_timeout):
             force_acquire(sock.lock)
+            sock.status = GoofySocketStatus.Closed
+            sock.lock.release()
 
-            if sock.status == GoofySocketStatus.Closed:
-                # no remote peer connected
-                self._send_error_and_close(client, REP_TTL_EXPIRED)
+            self._send_error_and_close(client, REP_TTL_EXPIRED)
 
-                self._sockets.pop(socket_id, None)
-                sock.lock.release()
-                self._sockets_lock.release()
+            force_acquire(self._sockets_lock)
+            self._sockets.pop(socket_id, None)
+            self._sockets_lock.release()
 
-                raise Exception("no remote peer connected")
-            elif sock.status != GoofySocketStatus.Open:
-                sock.status = GoofySocketStatus.Closed
-                self._send_error_and_close(client, REP_GENERAL_FAILURE)
+            raise Exception("timed out")
 
-                self._sockets.pop(socket_id, None)
-                sock.lock.release()
-                self._sockets_lock.release()
+        force_acquire(sock.lock)
 
-                raise ValueError("unexpected socket status")
+        if sock.status == GoofySocketStatus.Closed:
+            # no remote peer connected
+            sock.lock.release()
+            self._send_error_and_close(client, REP_TTL_EXPIRED)
 
-            if not sock.inbound_host:
-                # stop if we've been waiting for longer than bind_timeout
-                if time.time() - time_start > self._bind_timeout:
-                    sock.status = GoofySocketStatus.Closed
-                    self._send_error_and_close(client, REP_TTL_EXPIRED)
+            force_acquire(self._sockets_lock)
+            self._sockets.pop(socket_id, None)
+            self._sockets_lock.release()
 
-                    self._sockets.pop(socket_id, None)
-                    sock.lock.release()
-                    self._sockets_lock.release()
+            raise Exception("socket closed by goofy server")
+        elif sock.status != GoofySocketStatus.Open:
+            sock.status = GoofySocketStatus.Closed
+            sock.lock.release()
 
-                    return
+            self._send_error_and_close(client, REP_GENERAL_FAILURE)
 
-                # otherwise keep waiting
-                sock.lock.release()
-                self._sockets_lock.release()
-                time.sleep(self._poll_interval)
-                continue
-            else:
-                self._sockets_lock.release()
-                break
+            force_acquire(self._sockets_lock)
+            self._sockets.pop(socket_id, None)
+            self._sockets_lock.release()
+
+            raise ValueError(f"unexpected socket status: {sock.status}")
+
+        if not sock.inbound_host:
+            # the inbound info event was set but no inbound info is provided.
+            # this is never supposed to happen!
+
+            sock.status = GoofySocketStatus.Closed
+            sock.lock.release()
+
+            self._send_error_and_close(client, REP_GENERAL_FAILURE)
+
+            force_acquire(self._sockets_lock)
+            self._sockets.pop(socket_id, None)
+            self._sockets_lock.release()
+
+            raise ValueError(
+                "inbound info event was set but no inbound info was provided. "
+                "this should never happen."
+            )
+
+        sock.lock.release()
 
         self._log.debug(
             f"inbound connection from "
@@ -1098,9 +1103,8 @@ class GoofyClient:
         )
 
         # the control and receive threads will handle relaying and closing
-        sock.relaying = True
         sock.last_io_time = time.time()
-        sock.lock.release()
+        sock.relaying = True
         self._log.debug(
             f"relay planned: {sock.inbound_host}:{sock.inbound_port}"
         )
@@ -1563,10 +1567,13 @@ class GoofyClient:
 
                     force_acquire(sock.lock)
                     sock.status = GoofySocketStatus.Closed
-                    self._sockets.pop(packet.socket_id_u32, None)
+                    sock.lock.release()
+
                     if sock.relaying:
                         close_socket(sock.client)
-                    sock.lock.release()
+                    sock.status_updated_event.set()
+
+                    self._sockets.pop(packet.socket_id_u32, None)
                 elif isinstance(
                     packet,
                     (GoofySocketIoPacket, GoofySocketIoSmallPacket)
@@ -1648,6 +1655,8 @@ class GoofyClient:
                     force_acquire(sock.lock)
                     sock.status = packet.new_status
                     sock.lock.release()
+
+                    sock.status_updated_event.set()
                 elif isinstance(packet, GoofyEventSocketBindInfo):
                     if packet.socket_id_u32 not in self._sockets.keys():
                         continue
@@ -1658,6 +1667,8 @@ class GoofyClient:
                     sock.bind_host = packet.bind_host
                     sock.bind_port = packet.bind_port
                     sock.lock.release()
+
+                    sock.status_updated_event.set()
                 elif isinstance(packet, GoofyEventSocketInboundInfo):
                     if packet.socket_id_u32 not in self._sockets.keys():
                         continue
@@ -1668,6 +1679,9 @@ class GoofyClient:
                     sock.inbound_host = packet.inbound_host
                     sock.inbound_port = packet.inbound_port
                     sock.lock.release()
+                    
+                    sock.status_updated_event.set()
+                    sock.inbound_info_event.set()
                 elif isinstance(packet, GoofyEventUdpRelayClosed):
                     force_acquire(self._udp_relays_lock)
                     if packet.udp_relay_id_u16 not in self._udp_relays.keys():
