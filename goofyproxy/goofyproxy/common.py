@@ -239,7 +239,7 @@ def encode_str_len(s: str) -> bytes:
     b = s.encode()
     if len(b) >= 2**16:
         raise ValueError(
-            f"tried to encode a ginormous string ({len(b)} bytes in UTF-8)"
+            f"tried to encode ginormous string ({len(b)} bytes in UTF-8)"
         )
     return len(b).to_bytes(2) + b
 
@@ -959,4 +959,4 @@ def receive_goofy_packet(io: GoofyIo) -> GoofyPacket:
         udp_relay_id = int.from_bytes(io.receive(2))
         return GoofyEventUdpRelayClosed(udp_relay_id)
 
-    raise ValueError(f"unsupported goofy packet type ({packet_type})")
+    raise ValueError(f"unsupported goofy packet type: {packet_type}")
